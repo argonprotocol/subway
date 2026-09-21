@@ -80,6 +80,97 @@ impl MergeSubscriptionMiddleware {
         }
     }
 
+    async fn passthrough_storage_subscription(&self, request: SubscriptionRequest) -> SubscriptionResult {
+        let SubscriptionRequest {
+            subscribe,
+            params,
+            unsubscribe,
+            pending_sink,
+        } = request;
+
+        let mut subscription = match self.client.subscribe(&subscribe, params.clone(), &unsubscribe).await {
+            Ok(subscription) => subscription,
+            Err(err) => {
+                pending_sink.reject(errors::map_error(err)).await;
+                return Ok(());
+            }
+        };
+
+        let sink = match pending_sink.accept().await {
+            Ok(sink) => sink,
+            Err(err) => {
+                tracing::trace!("Failed to accept pending subscription {err:?}");
+                if let Err(err) = subscription.unsubscribe().await {
+                    tracing::error!("Failed to unsubscribe: {err}");
+                }
+                return Ok(());
+            }
+        };
+
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let initial_retry_delay = Duration::from_millis(100);
+            let mut retry_delay = initial_retry_delay;
+
+            'forward: loop {
+                tokio::select! {
+                    response = subscription.next() => {
+                        match response {
+                            Some(Ok(value)) => {
+                                retry_delay = initial_retry_delay;
+                                let message = match SubscriptionMessage::from_json(&value) {
+                                    Ok(message) => message,
+                                    Err(err) => {
+                                        tracing::error!("Failed to serialize subscription response: {err}");
+                                        continue;
+                                    }
+                                };
+                                if let Err(err) = sink.send(message).await {
+                                    tracing::trace!("subscription sink closed {err:?}");
+                                    break;
+                                }
+                                continue;
+                            }
+                            Some(Err(err)) => {
+                                tracing::error!("Upstream storage subscription failed; resubscribing: {err}");
+                            }
+                            None => tracing::debug!("Upstream storage subscription closed; resubscribing"),
+                        }
+
+                        loop {
+                            tokio::select! {
+                                _ = tokio::time::sleep(retry_delay) => {},
+                                _ = sink.closed() => break 'forward,
+                            }
+                            retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+
+                            let result = tokio::select! {
+                                result = client.subscribe(&subscribe, params.clone(), &unsubscribe) => result,
+                                _ = sink.closed() => break 'forward,
+                            };
+                            match result {
+                                Ok(new_subscription) => {
+                                    subscription = new_subscription;
+                                    break;
+                                }
+                                Err(err) => {
+                                    tracing::error!("Failed to resubscribe storage subscription: {err}");
+                                }
+                            }
+                        }
+                    }
+                    _ = sink.closed() => break,
+                }
+            }
+
+            if let Err(err) = subscription.unsubscribe().await {
+                tracing::trace!("Failed to unsubscribe storage subscription: {err}");
+            }
+        });
+
+        Ok(())
+    }
+
     async fn get_upstream_subscription(
         &self,
         key: CacheKey<Blake2b512>,
@@ -202,6 +293,18 @@ impl Middleware<SubscriptionRequest, SubscriptionResult> for MergeSubscriptionMi
         _next: NextFn<SubscriptionRequest, SubscriptionResult>,
     ) -> SubscriptionResult {
         async move {
+            // Multi-key requests need their own upstream stream so each downstream subscriber receives
+            // the complete initial value. Single-key requests retain the shared merge cache.
+            if matches!(self.merge_strategy, MergeStrategy::MergeStorageChanges)
+                && request
+                    .params
+                    .first()
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|keys| keys.len() > 1)
+            {
+                return self.passthrough_storage_subscription(request).await;
+            }
+
             let key = CacheKey::new(&request.subscribe, &request.params);
 
             let SubscriptionRequest {

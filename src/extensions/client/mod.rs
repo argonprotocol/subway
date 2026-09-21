@@ -326,6 +326,10 @@ impl Client {
                             response,
                             mut retries,
                         } => {
+                            if response.is_closed() {
+                                return;
+                            }
+
                             retries = retries.saturating_sub(1);
 
                             if let Ok(result) = tokio::time::timeout(
@@ -335,13 +339,21 @@ impl Client {
                             .await
                             {
                                 match result {
-                                    result @ Ok(_) => {
+                                    Ok(subscription) => {
                                         request_backoff_counter.store(0, std::sync::atomic::Ordering::Relaxed);
-                                        // make sure it's still connected
-                                        if response.is_closed() {
-                                            return;
+                                        if let Err(Ok(subscription)) = response.send(Ok(subscription)) {
+                                            match tokio::time::timeout(task_timeout, subscription.unsubscribe()).await {
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(err)) => {
+                                                    tracing::trace!(
+                                                        "Failed to unsubscribe canceled subscription: {err}"
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    tracing::trace!("Timed out unsubscribing canceled subscription");
+                                                }
+                                            }
                                         }
-                                        let _ = response.send(result);
                                     }
                                     Err(err) => {
                                         tracing::debug!("Subscribe failed: {:?}", err);
