@@ -6,7 +6,10 @@ use std::{
 
 use async_trait::async_trait;
 use blake2::Blake2b512;
-use jsonrpsee::{core::JsonValue, SubscriptionMessage};
+use jsonrpsee::{
+    core::{client::Error, JsonValue},
+    SubscriptionMessage,
+};
 use opentelemetry::trace::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
@@ -118,7 +121,7 @@ impl MergeSubscriptionMiddleware {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval.reset();
 
-                loop {
+                'forward: loop {
                     tokio::select! {
                         resp = subscription.next() => {
                             // break if no receiver
@@ -138,13 +141,21 @@ impl MergeSubscriptionMiddleware {
                                     }
                                 }
                             } else {
-                                match client.subscribe(&subscribe, params.clone(), &unsubscribe).await {
-                                    Ok(new_subscription) => {
-                                        subscription = new_subscription;
-                                    }
-                                    Err(err) => {
-                                        tracing::error!("failed to resubscribe {:?}", err);
-                                        break;
+                                loop {
+                                    if tx.receiver_count() == 0 { break 'forward; }
+
+                                    match client.subscribe(&subscribe, params.clone(), &unsubscribe).await {
+                                        Ok(new_subscription) => {
+                                            subscription = new_subscription;
+                                            break;
+                                        }
+                                        Err(err) => {
+                                            tracing::error!("failed to resubscribe {:?}", err);
+                                            if !matches!(err, Error::RequestTimeout | Error::Transport(_) | Error::RestartNeeded(_)) {
+                                                break 'forward;
+                                            }
+                                            tokio::time::sleep(Duration::from_secs(1)).await;
+                                        }
                                     }
                                 }
                             }
