@@ -1,3 +1,12 @@
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+use jsonrpsee::{
+    server::{RpcModule, ServerBuilder},
+    SubscriptionMessage,
+};
 use serde_json::json;
 
 use crate::{
@@ -239,4 +248,109 @@ async fn merge_subscription_works() {
 
     // stop server
     subway_server.handle.stop().unwrap();
+}
+
+#[tokio::test]
+async fn finalized_heads_resume_after_a_failed_resubscribe() {
+    use std::time::Duration;
+
+    let subscribe = "chain_subscribeFinalizedHeads";
+    let update = "chain_finalizedHead";
+    let unsubscribe = "chain_unsubscribeFinalizedHeads";
+
+    let mut first_upstream = TestServerBuilder::new();
+    let mut first_subscriptions = first_upstream.register_subscription(subscribe, update, unsubscribe);
+    let (first_addr, first_handle) = first_upstream.build().await;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut second_upstream = RpcModule::new(());
+    second_upstream
+        .register_subscription(subscribe, update, unsubscribe, {
+            let attempts = attempts.clone();
+            move |_, pending, _, _| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                    if let Ok(sink) = pending.accept().await {
+                        let _ = sink.send(SubscriptionMessage::from_json(&json!(2)).unwrap()).await;
+                        sink.closed().await;
+                    }
+                }
+            }
+        })
+        .unwrap();
+    let second_server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+    let second_addr = second_server.local_addr().unwrap();
+    let second_handle = second_server.start(second_upstream);
+
+    let config = Config {
+        extensions: ExtensionsConfig {
+            client: Some(ClientConfig {
+                endpoints: vec![format!("ws://{first_addr}"), format!("ws://{second_addr}")],
+                shuffle_endpoints: false,
+                request_timeout_seconds: Some(1),
+                connection_timeout_seconds: None,
+                retries: Some(1),
+            }),
+            server: Some(ServerConfig {
+                listen_address: "127.0.0.1".to_string(),
+                port: 0,
+                max_connections: 10,
+                max_subscriptions_per_connection: 1024,
+                max_batch_size: None,
+                request_timeout_seconds: 10,
+                http_methods: Vec::new(),
+                cors: None,
+            }),
+            merge_subscription: Some(MergeSubscriptionConfig {
+                keep_alive_seconds: Some(1),
+            }),
+            ..Default::default()
+        },
+        middlewares: MiddlewaresConfig {
+            methods: vec![],
+            subscriptions: vec!["merge_subscription".to_string(), "upstream".to_string()],
+        },
+        rpcs: RpcDefinitions {
+            methods: vec![],
+            subscriptions: vec![RpcSubscription {
+                subscribe: subscribe.to_string(),
+                unsubscribe: unsubscribe.to_string(),
+                name: update.to_string(),
+                merge_strategy: Some(MergeStrategy::Replace),
+            }],
+            aliases: vec![],
+        },
+    };
+
+    let proxy = server::build(config).await.unwrap();
+    let client = Client::with_endpoints([format!("ws://{}", proxy.addr)]).unwrap();
+    let mut finalized = client.subscribe(subscribe, vec![], unsubscribe).await.unwrap();
+
+    let first = first_subscriptions.recv().await.unwrap();
+    first.send(json!(1)).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), finalized.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        json!(1)
+    );
+
+    first_handle.stop().unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), finalized.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        json!(2)
+    );
+    assert!(attempts.load(Ordering::SeqCst) >= 2);
+
+    proxy.handle.stop().unwrap();
+    second_handle.stop().unwrap();
 }
